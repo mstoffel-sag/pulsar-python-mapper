@@ -1,0 +1,21 @@
+{
+    "apiVersion": "2",
+    "version": "1.0.0",
+    "provider": {
+        "name": "Cumulocity GmbH"
+    },
+    "isolation": "MULTI_TENANT",
+    "resources": {
+        "memory": "256M",
+        "cpu": "0.5"
+    },
+    "requiredRoles": [
+        "ROLE_INVENTORY_READ",
+        "ROLE_INVENTORY_ADMIN",
+        "ROLE_MEASUREMENT_ADMIN",
+        "ROLE_EVENT_ADMIN",
+        "ROLE_ALARM_ADMIN",
+        "ROLE_IDENTITY_ADMIN"
+    ],
+    "roles": []
+}

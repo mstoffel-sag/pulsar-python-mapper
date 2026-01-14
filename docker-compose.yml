@@ -1,0 +1,32 @@
+version: "3.8"
+
+services:
+  pulsar:
+    image: apachepulsar/pulsar:3.2.0
+    container_name: pulsar
+    ports:
+      - "6650:6650"
+      - "8080:8080"
+    command: bin/pulsar standalone
+    environment:
+      - PULSAR_MEM=-Xms512m -Xmx512m
+    healthcheck:
+      test: ["CMD", "bin/pulsar-admin", "brokers", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  microservice:
+    build: .
+    container_name: cumulocity-pulsar-bridge
+    depends_on:
+      pulsar:
+        condition: service_healthy
+    environment:
+      - C8Y_BASEURL=${C8Y_BASEURL}
+      - C8Y_TENANT=${C8Y_TENANT}
+      - C8Y_USER=${C8Y_USER}
+      - C8Y_PASSWORD=${C8Y_PASSWORD}
+      - PULSAR_SUBSCRIPTION=c8y-microservice
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    restart: unless-stopped
