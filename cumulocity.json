@@ -1,21 +1,33 @@
 {
-    "apiVersion": "2",
-    "version": "1.0.0",
-    "provider": {
-        "name": "Cumulocity GmbH"
+  "apiVersion": "2",
+  "version": "0.0.1-SNAPSHOT",
+  "provider": {
+    "name": "Cumulocity GmbH"
+  },
+  "isolation": "MULTI_TENANT",
+  "requiredRoles": [
+    "ROLE_MQTT_SERVICE_MESSAGING_TOPICS_READ",
+    "ROLE_MQTT_SERVICE_MESSAGING_TOPICS_UPDATE",
+    "ROLE_INVENTORY_CREATE",
+    "ROLE_IDENTITY_READ",
+    "ROLE_IDENTITY_ADMIN",
+    "ROLE_MEASUREMENT_ADMIN"
+  ],
+  "roles": [],
+  "livenessProbe": {
+    "httpGet": {
+      "path": "/health",
+      "port": 80
     },
-    "isolation": "MULTI_TENANT",
-    "resources": {
-        "memory": "256M",
-        "cpu": "0.5"
+    "initialDelaySeconds": 360,
+    "periodSeconds": 10
+  },
+  "readinessProbe": {
+    "httpGet": {
+      "path": "/health",
+      "port": 80
     },
-    "requiredRoles": [
-        "ROLE_INVENTORY_READ",
-        "ROLE_INVENTORY_ADMIN",
-        "ROLE_MEASUREMENT_ADMIN",
-        "ROLE_EVENT_ADMIN",
-        "ROLE_ALARM_ADMIN",
-        "ROLE_IDENTITY_ADMIN"
-    ],
-    "roles": []
+    "initialDelaySeconds": 10,
+    "periodSeconds": 10
+  }
 }
