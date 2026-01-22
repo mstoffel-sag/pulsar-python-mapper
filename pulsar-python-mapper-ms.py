@@ -172,7 +172,7 @@ class PulsarCumulocityBridge:
         """Initialize Apache Pulsar connection with message listener for a specific tenant"""
         try:
             c8y_tenant = c8y_api.tenant_id
-            pulsar_url = os.environ.get('C8Y_BASEURL_PULSAR', 'pulsar://cumulocity:6650')
+            pulsar_url = os.environ.get('C8Y_BASEURL_PULSAR')
             pulsar_topic = f'persistent://{c8y_api.tenant_id}/mqtt/from-device'
             subscription_name = f'{c8y_tenant}_pulsar-python-mapper'
 

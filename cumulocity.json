@@ -29,5 +29,9 @@
     },
     "initialDelaySeconds": 10,
     "periodSeconds": 10
+  },
+  "resources": {
+    "cpu": "0.5",
+    "memory": "500M"
   }
 }
