@@ -10,7 +10,7 @@ cleanup() {
 }
 
 # Set trap to cleanup on script exit (success or failure)
-#trap cleanup EXIT
+trap cleanup EXIT
 
 echo "Starting deployment process..."
 
