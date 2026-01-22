@@ -16,7 +16,7 @@ from c8y_api.model import Device, Measurement
 from c8y_api.app import MultiTenantCumulocityApp
 from flask import Flask, jsonify
 from pprint import pformat, pprint
-from 
+
 
 
 # Configure logging
