@@ -14,9 +14,9 @@ import pulsar
 from c8y_api import CumulocityApi
 from c8y_api.model import Device, Measurement
 from c8y_api.app import MultiTenantCumulocityApp
+from c8y_tk.app import SubscriptionListener
 from flask import Flask, jsonify
-from pprint import pformat, pprint
-
+from pprint import pformat
 
 
 # Configure logging
@@ -40,6 +40,7 @@ class PulsarCumulocityBridge:
         self.c8yapp: Optional[MultiTenantCumulocityApp] = None
         self._running = False
         self.pulsar_clients = {}  # tenant_id -> {'client': pulsar.Client, 'consumer': pulsar.Consumer, 'c8y_client': CumulocityApi}
+        self.subscription_listener: Optional[SubscriptionListener] = None
         
     def initialize_cumulocity(self):
         """Initialize Cumulocity connection"""
@@ -49,17 +50,53 @@ class PulsarCumulocityBridge:
             logging.info("CumulocityApp initialized.")
             c8y_bootstrap = self.c8yapp.bootstrap_instance
             logging.info(f"Bootstrap: {c8y_bootstrap.base_url}, Tenant: {c8y_bootstrap.tenant_id}, User:{c8y_bootstrap.username}")
-            #self.add_subscriber(c8y_bootstrap)
-            for subscriber_tenant_id in self.c8yapp.get_subscribers():
-                logging.info(f"Adding subscriber for tenant: {subscriber_tenant_id}")
-                self.add_subscriber(self.c8yapp.get_tenant_instance(subscriber_tenant_id))
-               
+                        
+            # Set up subscription listener for dynamic tenant tracking
+            self.subscription_listener = SubscriptionListener(
+                app=self.c8yapp,
+                blocking=False,  # Run callbacks in threads
+                polling_interval=10,  # Check every 5 minutes
+                startup_delay=2  # Wait 30 seconds before considering a tenant "added"
+            )
+            
+            # Add callbacks for tenant subscription changes
+            self.subscription_listener.add_callback(
+                callback=self.on_tenant_added,
+                when='added',
+                blocking=False
+            ).add_callback(
+                callback=self.on_tenant_removed,
+                when='removed',
+                blocking=False
+            )
+            
+            # Start the subscription listener
+            self.subscription_listener.start()
+            logging.info("Subscription listener started")
             
         except Exception as e:
             logger.error(f"Failed to connect to Cumulocity: {e}")
             raise
             
+    def on_tenant_added(self, tenant_id: str):
+        """Handle when a new tenant subscribes"""
+        try:
+            logging.info(f"Tenant subscribed: {tenant_id}")
+            c8y_api = self.c8yapp.get_tenant_instance(tenant_id)
+            self.add_subscriber(c8y_api)
+        except Exception as e:
+            logger.error(f"Error adding subscriber for tenant {tenant_id}: {e}")
+    
+    def on_tenant_removed(self, tenant_id: str):
+        """Handle when a tenant unsubscribes"""
+        try:
+            logging.info(f"Tenant unsubscribed: {tenant_id}")
+            self.remove_subscriber(tenant_id)
+        except Exception as e:
+            logger.error(f"Error removing subscriber for tenant {tenant_id}: {e}")
+    
     def add_subscriber(self, c8y_api: CumulocityApi):
+        """Add a subscriber and initialize Pulsar connection"""
         logging.info(f"Subscriber: {c8y_api.tenant_id} creating pulsar connection")
         c8y_client = c8y_api
         pulsar_client, consumer = self.initialize_pulsar(c8y_api)
@@ -68,6 +105,24 @@ class PulsarCumulocityBridge:
             'consumer': consumer,
             'c8y_client': c8y_client
         }
+    
+    def remove_subscriber(self, tenant_id: str):
+        """Remove a subscriber and cleanup Pulsar connection"""
+        if tenant_id in self.pulsar_clients:
+            logging.info(f"Closing Pulsar connections for unsubscribed tenant {tenant_id}")
+            connections = self.pulsar_clients[tenant_id]
+            try:
+                if connections.get('consumer'):
+                    connections['consumer'].close()
+                    time.sleep(1)  # Give some time to close consumer
+                if connections.get('client'):
+                    connections['client'].close()
+            except Exception as e:
+                logger.error(f"Error closing Pulsar connections for tenant {tenant_id}: {e}")
+            finally:
+                del self.pulsar_clients[tenant_id]
+        else:
+            logging.warning(f"Tenant {tenant_id} not found in pulsar_clients")
 
     def message_listener(self, tenant_id: str, c8y_api: CumulocityApi, consumer, message):
         """Callback function for processing incoming Pulsar messages for a specific tenant"""
@@ -92,7 +147,7 @@ class PulsarCumulocityBridge:
             consumer.acknowledge(message)
             logger.error(f"Tenant {tenant_id}: Error processing message: {e}")
 
-    def process_message(self, tenant_id: str, c8y_api: CumulocityApi, consumer, topic: str, client_id: str, message: any):
+    def process_message(self, tenant_id: str, c8y_api: CumulocityApi, consumer: pulsar.Consumer, topic: str, client_id: str, message: any):
         """Process incoming message and send to Cumulocity for a specific tenant"""
         try:
             raw_data = message.data()
@@ -104,7 +159,7 @@ class PulsarCumulocityBridge:
                 message_data = json.loads(decoded_message)
             except json.JSONDecodeError:
                 logger.error(f"Tenant {tenant_id}: Failed to decode JSON message: {decoded_message}")
-                consumer.acknowledge(message)
+                consumer.negative_acknowledge(message)
                 return
 
             # Now we have the challenge to check whether the device already exists in Cumulocity. If not, we have create it. 
@@ -116,22 +171,26 @@ class PulsarCumulocityBridge:
                 external_id = client_id
             else:
                 logger.error(f"Tenant {tenant_id}: No clientID property found in message")
-                consumer.acknowledge(message)
+                consumer.negative_acknowledge(message)
                 return
             
             # Check if device exists
             device = self.get_device(c8y_api, external_id)
             if device is None:
                 logger.error(f"Tenant {tenant_id}: Device with external ID {external_id} could not be created or retrieved.")
-                consumer.acknowledge(message)
+                consumer.negative_acknowledge(message)
                 return
             
-            #### We assume the message contains measurement data in a specific format like: 
+            # Now we have the device, we can create a measurement.
+            # For this example, we assume the message contains temperature and pressure data.
+            # We assume the message send to the MQTT-Service contains measurement data in a specific format like: 
             # {
             #   "timestamp": "2026-01-14T12:00:00Z",
             #   "temperature":  23.5,
             #   "pressure": 90
             # }
+            # You have to adjust the code accordingly if your message format is different.
+
             time = datetime.fromisoformat(message_data.get('timestamp'))
             temperature = message_data.get('temperature')
             pressure = message_data.get('pressure')
@@ -145,7 +204,7 @@ class PulsarCumulocityBridge:
                 
         except Exception as e:
             logger.error(f"Tenant {tenant_id}: Failed to process message: {e}")
-            consumer.acknowledge(message)
+            consumer.negative_acknowledge(message)
 
     def get_device(self, c8y_client: CumulocityApi, external_id: str) -> Optional[Device]:
         """Retrieve or create device in Cumulocity by external ID"""
@@ -192,11 +251,11 @@ class PulsarCumulocityBridge:
             )
             
             # Create tenant-specific message listener
-            def tenant_message_listener(consumer, message):
+            def tenant_message_listener(consumer: pulsar.Consumer, message):
                 self.message_listener(c8y_tenant, c8y_api, consumer, message)
             
             # Subscribe with message listener for event-driven processing
-            consumer = pulsar_client.subscribe(
+            consumer: pulsar.Consumer = pulsar_client.subscribe(
                 topic=pulsar_topic,
                 subscription_name=subscription_name,
                 consumer_type=pulsar.ConsumerType.Shared,
@@ -232,6 +291,14 @@ class PulsarCumulocityBridge:
         self._running = False
         logger.info("Stopping Pulsar-Cumulocity bridge")
         
+        # Stop subscription listener
+        if self.subscription_listener:
+            logger.info("Stopping subscription listener")
+            try:
+                self.subscription_listener.shutdown(timeout=10)
+            except Exception as e:
+                logger.error(f"Error stopping subscription listener: {e}")
+        
         # Close all Pulsar connections
         for tenant_id, connections in self.pulsar_clients.items():
             logger.info(f"Closing Pulsar connections for tenant {tenant_id}")
@@ -263,7 +330,8 @@ def health_check():
 
 def run_health_server():
     """Run the Flask health server in a separate thread"""
-    app.run(host='0.0.0.0', port=80, debug=False, use_reloader=False)
+    from waitress import serve
+    serve(app, host='0.0.0.0', port=80, threads=1)
 
 
 def main():
