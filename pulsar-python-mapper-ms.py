@@ -42,16 +42,11 @@ class PulsarCumulocityBridge:
         self.pulsar_clients = {}  # tenant_id -> {'client': pulsar.Client, 'consumer': pulsar.Consumer, 'c8y_client': CumulocityApi}
         self.subscription_listener: Optional[SubscriptionListener] = None
         
-    def initialize_cumulocity(self):
+    def initialize_subscription_listener(self):
         """Initialize Cumulocity connection"""
         try:
-            # Get Cumulocity credentials from environment
-            self.c8yapp = MultiTenantCumulocityApp()
-            logging.info("CumulocityApp initialized.")
-            c8y_bootstrap = self.c8yapp.bootstrap_instance
-            logging.info(f"Bootstrap: {c8y_bootstrap.base_url}, Tenant: {c8y_bootstrap.tenant_id}, User:{c8y_bootstrap.username}")
-                        
             # Set up subscription listener for dynamic tenant tracking
+            self.c8yapp = MultiTenantCumulocityApp()
             self.subscription_listener = SubscriptionListener(
                 app=self.c8yapp,
                 blocking=False,  # Run callbacks in threads
@@ -61,11 +56,11 @@ class PulsarCumulocityBridge:
             
             # Add callbacks for tenant subscription changes
             self.subscription_listener.add_callback(
-                callback=self.on_tenant_added,
+                callback=self.add_subscriber,
                 when='added',
                 blocking=False
             ).add_callback(
-                callback=self.on_tenant_removed,
+                callback=self.remove_subscriber,
                 when='removed',
                 blocking=False
             )
@@ -78,51 +73,55 @@ class PulsarCumulocityBridge:
             logger.error(f"Failed to connect to Cumulocity: {e}")
             raise
             
-    def on_tenant_added(self, tenant_id: str):
-        """Handle when a new tenant subscribes"""
+
+    def add_subscriber(self, tenant_id: str):
+        """Add a subscriber and initialize Pulsar connection"""
         try:
-            logging.info(f"Tenant subscribed: {tenant_id}")
+            
+            logger.info(f"Tenant subscription event received: {tenant_id}")
+            self.c8yapp = MultiTenantCumulocityApp()
             c8y_api = self.c8yapp.get_tenant_instance(tenant_id)
-            self.add_subscriber(c8y_api)
+            logger.info(f"add_subscriber called for tenant {tenant_id}")
+            time.sleep(2)  # Allow time for previous connections to fully close
+            logger.info(f"Delay completed, proceeding with Pulsar initialization for tenant {tenant_id}")
+            pulsar_client, consumer = self.initialize_pulsar(c8y_api)
+            self.pulsar_clients[tenant_id] = {
+                'client': pulsar_client,
+                'consumer': consumer,
+                'c8y_client': c8y_api
+            }
+            logger.info(f"Tenant {tenant_id} successfully added and Pulsar connection established")
         except Exception as e:
             logger.error(f"Error adding subscriber for tenant {tenant_id}: {e}")
     
-    def on_tenant_removed(self, tenant_id: str):
-        """Handle when a tenant unsubscribes"""
-        try:
-            logging.info(f"Tenant unsubscribed: {tenant_id}")
-            self.remove_subscriber(tenant_id)
-        except Exception as e:
-            logger.error(f"Error removing subscriber for tenant {tenant_id}: {e}")
-    
-    def add_subscriber(self, c8y_api: CumulocityApi):
-        """Add a subscriber and initialize Pulsar connection"""
-        logging.info(f"Subscriber: {c8y_api.tenant_id} creating pulsar connection")
-        c8y_client = c8y_api
-        pulsar_client, consumer = self.initialize_pulsar(c8y_api)
-        self.pulsar_clients[c8y_api.tenant_id] = {
-            'client': pulsar_client,
-            'consumer': consumer,
-            'c8y_client': c8y_client
-        }
-    
     def remove_subscriber(self, tenant_id: str):
         """Remove a subscriber and cleanup Pulsar connection"""
-        if tenant_id in self.pulsar_clients:
-            logging.info(f"Closing Pulsar connections for unsubscribed tenant {tenant_id}")
-            connections = self.pulsar_clients[tenant_id]
-            try:
-                if connections.get('consumer'):
-                    connections['consumer'].close()
-                    time.sleep(1)  # Give some time to close consumer
-                if connections.get('client'):
-                    connections['client'].close()
-            except Exception as e:
-                logger.error(f"Error closing Pulsar connections for tenant {tenant_id}: {e}")
-            finally:
-                del self.pulsar_clients[tenant_id]
-        else:
-            logging.warning(f"Tenant {tenant_id} not found in pulsar_clients")
+        try:
+            logger.info(f"Tenant unsubscription event received: {tenant_id}")
+            logger.info(f"remove_subscriber called for tenant {tenant_id}")
+            if tenant_id in self.pulsar_clients:
+                logger.info(f"Found existing Pulsar connections for tenant {tenant_id}, proceeding with cleanup")
+                connections = self.pulsar_clients[tenant_id]
+                try:
+                    if connections.get('consumer'):
+                        logger.info(f"Closing Pulsar consumer for tenant {tenant_id}")
+                        connections['consumer'].close()
+                        time.sleep(2)  # Give more time to close consumer
+                        logger.info(f"Pulsar consumer closed for tenant {tenant_id}")
+                    if connections.get('client'):
+                        logger.info(f"Closing Pulsar client for tenant {tenant_id}")
+                        connections['client'].close()
+                        logger.info(f"Pulsar client closed for tenant {tenant_id}")
+                except Exception as close_error:
+                    logger.error(f"Error closing Pulsar connections for tenant {tenant_id}: {close_error}")
+                finally:
+                    del self.pulsar_clients[tenant_id]
+                    logger.info(f"Removed tenant {tenant_id} from pulsar_clients dictionary")
+            else:
+                logger.warning(f"Tenant {tenant_id} not found in pulsar_clients")
+            logger.info(f"Tenant {tenant_id} successfully removed and Pulsar connections cleaned up")
+        except Exception as e:
+            logger.error(f"Error removing subscriber for tenant {tenant_id}: {e}")
 
     def message_listener(self, tenant_id: str, c8y_api: CumulocityApi, consumer, message):
         """Callback function for processing incoming Pulsar messages for a specific tenant"""
@@ -200,7 +199,7 @@ class PulsarCumulocityBridge:
                        TempPress={'temperature': {'value': temperature, 'unit': '°C'},
                                 'pressure': {'value': pressure, 'unit': 'kPa'}})
             c8y_api.measurements.create(measurement)
-            logger.info(f"Tenant {tenant_id}: Sent measurement for device {device.id}  {pformat(measurement.to_json())}")
+            logger.info(f"Tenant {tenant_id}: Sent measurement for device {device.id}\n{pformat(measurement.to_json())}")
                 
         except Exception as e:
             logger.error(f"Tenant {tenant_id}: Failed to process message: {e}")
@@ -234,9 +233,8 @@ class PulsarCumulocityBridge:
             pulsar_url = os.environ.get('C8Y_BASEURL_PULSAR')
             pulsar_topic = f'persistent://{c8y_api.tenant_id}/mqtt/from-device'
             subscription_name = f'{c8y_tenant}_pulsar-python-mapper'
-
             logger.info(f"Connecting to Pulsar for tenant {c8y_tenant} at {pulsar_url}")
-            
+
             # Configure authentication using C8Y credentials
             auth_params = {}
             logger.info(f"Using basic authentication for user: {c8y_api.auth.username}")
@@ -344,7 +342,7 @@ def main():
     
     try:
         # Initialize connections
-        bridge_instance.initialize_cumulocity()
+        bridge_instance.initialize_subscription_listener()
         
         # Start health server in background thread
         health_thread = threading.Thread(target=run_health_server, daemon=True)
