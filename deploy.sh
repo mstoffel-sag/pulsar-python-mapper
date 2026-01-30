@@ -1,5 +1,5 @@
 #!/bin/sh
-DOCKER_DEFAULT_PLATFORM=linux/arm64 docker run --privileged --rm tonistiigi/binfmt --install all
+docker run --privileged --rm tonistiigi/binfmt --install all
 export DOCKER_DEFAULT_PLATFORM=linux/amd64
 # Function to cleanup temporary files
 cleanup() {
