@@ -17,6 +17,8 @@ from c8y_api.app import MultiTenantCumulocityApp
 from c8y_tk.app import SubscriptionListener
 from flask import Flask, jsonify
 from pprint import pformat
+# Use the stdlib threading module for background tasks
+
 
 
 # Configure logging
@@ -41,6 +43,7 @@ class PulsarCumulocityBridge:
         self._running = False
         self.pulsar_clients = {}  # tenant_id -> {'client': pulsar.Client, 'consumer': pulsar.Consumer, 'c8y_client': CumulocityApi}
         self.subscription_listener: Optional[SubscriptionListener] = None
+        self.device_cache = {}  # {tenant_id -> {external_id -> Device}}
         
     def initialize_subscription_listener(self):
         """Initialize Cumulocity connection"""
@@ -136,11 +139,16 @@ class PulsarCumulocityBridge:
                 logger.info(f"Tenant {tenant_id}: Ignoring message from topic: {topic}")
                 consumer.acknowledge(message)
                 return
-            else:         
-                # Process the message
-                self.process_message(tenant_id, c8y_api, consumer, topic, client_id, message)
+            else:
+                # Process the message in a separate thread to avoid blocking the listener
+                t = threading.Thread(
+                    target=self.process_message,
+                    args=(tenant_id, c8y_api, consumer, topic, client_id, message),
+                    daemon=True,
+                )
+                t.start()
                 # Acknowledge the message
-                consumer.acknowledge(message) 
+                consumer.acknowledge(message)
 
         except Exception as e:
             consumer.acknowledge(message)
@@ -194,20 +202,43 @@ class PulsarCumulocityBridge:
             temperature = message_data.get('temperature')
             pressure = message_data.get('pressure')
 
-            measurement = Measurement(type='TempPress', source=device.id,
-                       time=time,
-                       TempPress={'temperature': {'value': temperature, 'unit': '°C'},
-                                'pressure': {'value': pressure, 'unit': 'kPa'}})
-            c8y_api.measurements.create(measurement)
-            logger.info(f"Tenant {tenant_id}: Sent measurement for device {device.id}\n{pformat(measurement.to_json())}")
+            # Try creating measurement, retry once if device was deleted (422 error)
+            for attempt in range(2):
+                measurement = Measurement(type='TempPress', source=device.id, time=time,
+                           TempPress={'temperature': {'value': temperature, 'unit': '°C'},
+                                    'pressure': {'value': pressure, 'unit': 'kPa'}})
+                try:
+                    c8y_api.measurements.create(measurement)
+                    logger.info(f"Tenant {tenant_id}: Sent measurement for device {device.id}\n{pformat(measurement.to_json())}")
+                    break
+                except Exception as e:
+                    if attempt == 0 and ('422' in str(e) or 'Unprocessable Entity' in str(e)):
+                        logger.warning(f"Tenant {tenant_id}: Device {external_id} deleted, refreshing cache")
+                        if tenant_id in self.device_cache and external_id in self.device_cache[tenant_id]:
+                            del self.device_cache[tenant_id][external_id]
+                        device = self.get_device(c8y_api, external_id)
+                        if not device:
+                            raise
+                    else:
+                        raise
                 
         except Exception as e:
             logger.error(f"Tenant {tenant_id}: Failed to process message: {e}")
             consumer.negative_acknowledge(message)
 
     def get_device(self, c8y_client: CumulocityApi, external_id: str) -> Optional[Device]:
-        """Retrieve or create device in Cumulocity by external ID"""
-
+        """Retrieve or create device in Cumulocity by external ID with caching"""
+        tenant_id = c8y_client.tenant_id
+        
+        # Check device cache first
+        if tenant_id in self.device_cache and external_id in self.device_cache[tenant_id]:
+            logger.info(f"Tenant {tenant_id}: Device {external_id} found in cache")
+            return self.device_cache[tenant_id][external_id]
+        
+        # Initialize cache for this tenant if not exists
+        if tenant_id not in self.device_cache:
+            self.device_cache[tenant_id] = {}
+        
         device = None
         try:
             device = c8y_client.identity.get_object(external_id, self.external_id_type)
@@ -219,11 +250,16 @@ class PulsarCumulocityBridge:
                 device = Device(c8y_client, type=self.device_type, name=f'{self.device_prefix}{external_id}').create()
                 c8y_client.identity.create(external_id, self.external_id_type, device.id)
                 logger.info(f"Created new device with ID: {device.id} for external ID: {external_id}")
-                return device
             except Exception as e:
                 logger.error(f"Failed to create device for external ID {external_id}: {e}")
                 # @todo handle creation failure, what if device creation works but external ID creation fails?
                 return None
+        
+        # Cache the device
+        if device:
+            self.device_cache[tenant_id][external_id] = device
+            logger.info(f"Tenant {tenant_id}: Device {external_id} cached with ID {device.id}")
+        
         return device
 
     def initialize_pulsar(self, c8y_api: CumulocityApi):
